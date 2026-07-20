@@ -49,7 +49,7 @@ ci:
           committed_by: seed
     staging:
       sha: e77bb862a8e6f7f8b64f2be08b397f7f6fdbc336
-      version: v0.1.0-rc.0
+      version: v0.16.6-dryrun.82
       committed_at: "2026-07-20T17:59:47Z"
       committed_by: joshua-temple
       deploys:
