@@ -48,16 +48,16 @@ ci:
           committed_at: "2026-07-10T00:00:00Z"
           committed_by: seed
     staging:
-      sha: a7463874c3b5cacdd438fb34edbd00ea67b2e296
-      version: v0.16.6-rc.0
-      committed_at: "2026-07-20T07:44:00Z"
+      sha: 6948194a64c430761c4e95102ad2b1a08eb2f6b7
+      version: v0.1.0-rc.0
+      committed_at: "2026-07-20T10:20:17Z"
       committed_by: joshua-temple
       deploys:
         app:
-          sha: a7463874c3b5cacdd438fb34edbd00ea67b2e296
-          deployed_at: "2026-07-20T07:44:00Z"
+          sha: 6948194a64c430761c4e95102ad2b1a08eb2f6b7
+          deployed_at: "2026-07-20T10:20:17Z"
           deployed_by: joshua-temple
       builds:
         build:
-          sha: a7463874c3b5cacdd438fb34edbd00ea67b2e296
-          artifact_id: app-a7463874c3b5cacdd438fb34edbd00ea67b2e296
+          sha: 6948194a64c430761c4e95102ad2b1a08eb2f6b7
+          artifact_id: app-6948194a64c430761c4e95102ad2b1a08eb2f6b7
