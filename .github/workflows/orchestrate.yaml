@@ -49,10 +49,10 @@ jobs:
         with:
           fetch-depth: 0
       - name: Setup CLI
-        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.6-rc.0
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.6-dryrun.82
         with:
           token: ${{ secrets.CASCADE_STATE_TOKEN }}
-          version: v0.16.6-rc.0
+          version: v0.16.6-dryrun.82
       - name: Run Setup
         id: setup
         env:
@@ -122,10 +122,10 @@ jobs:
             echo "_No outputs produced_" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Setup CLI
-        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.6-rc.0
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.6-dryrun.82
         with:
           token: ${{ secrets.CASCADE_STATE_TOKEN }}
-          version: v0.16.6-rc.0
+          version: v0.16.6-dryrun.82
       - name: Generate Changelog
         id: changelog
         env:
@@ -281,14 +281,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
-          deployment_id=$(gh api repos/${{ github.repository }}/deployments \
-            --method POST \
-            --field ref=${{ github.sha }} \
-            --field environment="$ENV_NAME" \
-            --field auto_merge=false \
-            --raw-field required_contexts='[]' \
-            --field auto_inactive=false \
-            --jq '.id')
+          deployment_id=$(printf '{"ref":"%s","environment":"%s","auto_merge":false,"required_contexts":[],"auto_inactive":false}' "${{ github.sha }}" "$ENV_NAME" \
+            | gh api repos/${{ github.repository }}/deployments \
+              --method POST \
+              --input - \
+              --jq '.id')
           echo "deployment_id=${deployment_id}" >> "$GITHUB_OUTPUT"
       - name: Set deployment in_progress
         if: ${{ github.server_url == 'https://github.com' && github.event.inputs.dry_run != 'true' }}
