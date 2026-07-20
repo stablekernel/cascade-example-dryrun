@@ -47,4 +47,17 @@ ci:
           version: v0.9.0
           committed_at: "2026-07-10T00:00:00Z"
           committed_by: seed
-    staging: {}
+    staging:
+      sha: 4e6539ae95fbaa996103136a32632fe5d5cc1b86
+      version: v0.1.0-rc.0
+      committed_at: "2026-07-20T07:40:57Z"
+      committed_by: joshua-temple
+      deploys:
+        app:
+          sha: 4e6539ae95fbaa996103136a32632fe5d5cc1b86
+          deployed_at: "2026-07-20T07:40:57Z"
+          deployed_by: joshua-temple
+      builds:
+        build:
+          sha: 4e6539ae95fbaa996103136a32632fe5d5cc1b86
+          artifact_id: app-4e6539ae95fbaa996103136a32632fe5d5cc1b86
