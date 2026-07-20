@@ -1,0 +1,407 @@
+name: scenario-suite
+
+# Proves, on real GitHub, two runtime-semantic properties the local act/gitea
+# harness cannot express:
+#
+#   1. NATIVE GitHub Deployments. A real (non-dry-run) orchestrate run deploys
+#      staging and its finalize job creates a real GitHub Deployment through the
+#      Deployments API, reports it in_progress, then reports a terminal success
+#      status carrying the configured environment_url. act/gitea has no
+#      Deployments API, so only real GitHub can observe the Deployment record.
+#
+#   2. DRY-RUN promote and rollback are rehearsals that mutate nothing. A promote
+#      dispatched with dry_run=true and a rollback dispatched with dry_run=true
+#      each conclude SUCCESS while the committed manifest state, the git tags and
+#      releases, and the GitHub Deployments are all UNCHANGED, and their mutating
+#      jobs (promote, deploy, finalize) are SKIPPED. The "no new Deployment under
+#      a dry run" assertion is a real-GitHub-only regression guard: the native
+#      Deployment steps are gated on a non-dry-run run, and only a repo with a
+#      live Deployments API can prove a dry run created no Deployment.
+#
+# The suite never runs a lifecycle inline. It merges a source change to fire the
+# generated orchestrate workflow, then dispatches the generated promote and
+# rollback workflows with dry_run=true and reads run job conclusions, the
+# committed state, the Deployments API, and the tag/release list. Every run it
+# causes is registered into the fleet ledger; the final reconcile job fails
+# closed on any unregistered run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cascade_version:
+        description: 'cascade rc tag to self-repin to (e.g. v0.16.4-rc.0). Empty runs committed defaults.'
+        required: false
+        default: ''
+      cascade_version_sha:
+        description: 'Peeled commit SHA paired with cascade_version. Empty runs committed defaults.'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * 3'
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  deployments: write
+
+concurrency:
+  group: scenario-suite
+  cancel-in-progress: false
+
+env:
+  MANIFEST: .github/manifest.yaml
+  MANIFEST_KEY: ci
+
+jobs:
+  open-window:
+    name: Open reconcile window
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      window-start: ${{ steps.window.outputs.window-start }}
+    steps:
+      # The reconcile window opens before any run, so every run the suite causes
+      # lands at or after this timestamp and the reconcile job sees it.
+      - name: Open reconcile window
+        id: window
+        run: |
+          set -euo pipefail
+          WINDOW_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "window-start=$WINDOW_START" >> "$GITHUB_OUTPUT"
+          echo "reconcile window opened at $WINDOW_START"
+
+  lifecycle:
+    name: Native deployment plus dry-run promote and rollback
+    needs: [open-window]
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+      TRUNK: main
+    outputs:
+      orchestrate_run_id: ${{ steps.orchestrate.outputs.run_id }}
+      promote_run_id: ${{ steps.promote.outputs.run_id }}
+      rollback_run_id: ${{ steps.rollback.outputs.run_id }}
+    steps:
+      - name: Install gh transient-retry wrapper
+        run: |
+          cat > "$RUNNER_TEMP/gh-retry.sh" <<'GHRETRY'
+          _gh_is_transient() {
+            local out="$1"
+            if printf '%s' "$out" | grep -qiE 'HTTP 5[0-9][0-9]|HTTP 429|HTTP 401|Bad credentials|was submitted too quickly|secondary rate limit'; then
+              return 0
+            fi
+            if printf '%s' "$out" | grep -qiE 'HTTP 403'; then
+              if printf '%s' "$out" | grep -qiE 'rate limit|secondary|abuse|too quickly'; then
+                return 0
+              fi
+            fi
+            return 1
+          }
+          gh() {
+            local attempt=1 max="${GH_RETRY_MAX:-5}" delay="${GH_RETRY_BASE_DELAY:-3}" out rc
+            while :; do
+              out="$(command gh "$@" 2>&1)" && rc=0 || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              if [ "$attempt" -ge "$max" ] || ! _gh_is_transient "$out"; then
+                printf '%s\n' "$out" >&2
+                return "$rc"
+              fi
+              printf 'gh: transient error on attempt %d/%d, retrying in %ds\n%s\n' "$attempt" "$max" "$delay" "$out" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+          GHRETRY
+          echo "BASH_ENV=$RUNNER_TEMP/gh-retry.sh" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up cascade CLI
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.5
+        with:
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+          version: ${{ inputs.cascade_version || 'v0.16.4' }}
+
+      - name: Log cascade version mode
+        run: |
+          if [ -n "${{ inputs.cascade_version }}" ]; then
+            echo "Running against dispatched rc: ${{ inputs.cascade_version }} (sha ${{ inputs.cascade_version_sha }})"
+          else
+            echo "Running against committed defaults (no rc dispatched)"
+          fi
+
+      - name: Self-repin manifest to the dispatched rc
+        uses: stablekernel/cascade/.github/actions/fleet-repin@main
+        with:
+          cascade_version: ${{ inputs.cascade_version }}
+          cascade_version_sha: ${{ inputs.cascade_version_sha }}
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+
+      - name: Clean slate - delete leftover releases and tags
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | while read -r t; do gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true; done
+          git fetch --tags --quiet || true
+          for t in $(git tag -l 'v*' 'rel-*'); do git push origin --delete "$t" 2>/dev/null || true; done
+
+      # --- Phase A: real orchestrate deploys staging and creates a native Deployment ---
+
+      - name: Count staging deployments before the orchestrate run
+        id: predeploy
+        run: |
+          set -euo pipefail
+          BEFORE="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=staging&per_page=100" --jq 'length' || echo 0)"
+          echo "staging_before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "staging deployments before: $BEFORE"
+
+      - name: Open and merge a source change
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="scenario/src-$(date +%s)"
+          git checkout -b "$BRANCH"
+          mkdir -p src
+          echo "touched at $(date -u +%FT%TZ)" >> src/scenario.txt
+          git add src/scenario.txt
+          git commit --no-gpg-sign -m "feat: scenario source change"
+          git push origin "$BRANCH"
+          PR_URL="$(gh pr create --base "$TRUNK" --head "$BRANCH" \
+            --title "feat: scenario source change" \
+            --body "Automated scenario run. Drives orchestrate on merge.")"
+          echo "Opened $PR_URL"
+          gh pr merge "$BRANCH" --rebase --delete-branch
+          git fetch origin "$TRUNK" --quiet
+          MERGE_SHA="$(git rev-parse "origin/$TRUNK")"
+          echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "merged as $MERGE_SHA"
+
+      - name: Wait for the orchestrate run on the merge sha
+        id: orchestrate
+        env:
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          RUN_ID=""
+          for i in $(seq 1 6); do
+            RUN_ID="$(gh run list --workflow=orchestrate.yaml --branch=main \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha==\"$MERGE_SHA\") | .databaseId" | head -n1 || true)"
+            [ -n "$RUN_ID" ] && break
+            echo "attempt $i: no orchestrate run for $MERGE_SHA yet"
+            sleep 60
+          done
+          [ -n "$RUN_ID" ] || { echo "::error::no orchestrate run found for $MERGE_SHA"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          gh run watch "$RUN_ID" --exit-status --interval 60
+
+      - name: Register orchestrate run
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.orchestrate.outputs.run_id }}
+          expected-conclusion: success
+          reason: native-deployment-real-run
+          upload: 'true'
+
+      - name: Assert a native staging Deployment was created and succeeded
+        env:
+          BEFORE: ${{ steps.predeploy.outputs.staging_before }}
+        run: |
+          set -euo pipefail
+          fail=0
+          AFTER="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=staging&per_page=100" --jq 'length' || echo 0)"
+          echo "staging deployments after: $AFTER (before $BEFORE)"
+          if [ "$AFTER" -le "$BEFORE" ]; then
+            echo "::error::real orchestrate created no native staging Deployment (before=$BEFORE after=$AFTER)"; fail=1
+          fi
+          DID="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=staging&per_page=100" --jq '.[0].id' || echo '')"
+          if [ -n "$DID" ]; then
+            STATE="$(gh api "repos/$GITHUB_REPOSITORY/deployments/$DID/statuses" --jq '.[0].state' || echo '')"
+            echo "latest staging Deployment $DID terminal status: $STATE"
+            if [ "$STATE" != "success" ]; then
+              echo "::error::latest staging Deployment status was '$STATE', expected 'success'"; fail=1
+            fi
+          else
+            echo "::error::could not read the created Deployment id"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+
+      # --- Baselines for the dry-run non-mutation assertions (recorded post-Phase A) ---
+
+      - name: Record post-orchestrate baselines
+        id: baseline
+        run: |
+          set -euo pipefail
+          git fetch origin "$TRUNK" --quiet
+          STATE_BLOB="$(git rev-parse "origin/$TRUNK:$MANIFEST")"
+          TAGS="$(git ls-remote --tags origin | wc -l | tr -d ' ')"
+          RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq 'length' || echo 0)"
+          DEPLOYS="$(gh api "repos/$GITHUB_REPOSITORY/deployments?per_page=100" --jq 'length' || echo 0)"
+          {
+            echo "state_blob=$STATE_BLOB"
+            echo "tags=$TAGS"
+            echo "releases=$RELEASES"
+            echo "deploys=$DEPLOYS"
+          } >> "$GITHUB_OUTPUT"
+          echo "baseline state_blob=$STATE_BLOB tags=$TAGS releases=$RELEASES deploys=$DEPLOYS"
+
+      # --- Phase C: dry-run promote rehearses staging -> prod, mutating nothing ---
+
+      - name: Dispatch dry-run promote
+        id: promote
+        run: |
+          set -euo pipefail
+          BEFORE="$(date -u +%s)"
+          gh workflow run promote.yaml --ref "$TRUNK" \
+            -f mode=default -f dry_run=true -f deploys=all
+          RUN_ID=""
+          for i in $(seq 1 12); do
+            RUN_ID="$(gh run list --workflow=promote.yaml --event=workflow_dispatch \
+              --json databaseId,createdAt \
+              --jq "[.[] | select((.createdAt | fromdateiso8601) >= $BEFORE)] | (.[0].databaseId // empty)" | head -n1 || true)"
+            [ -n "$RUN_ID" ] && break
+            echo "attempt $i: dry-run promote run not visible yet"
+            sleep 15
+          done
+          [ -n "$RUN_ID" ] || { echo "::error::no dry-run promote run found"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          gh run watch "$RUN_ID" --exit-status --interval 30
+
+      - name: Register dry-run promote run
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.promote.outputs.run_id }}
+          expected-conclusion: success
+          reason: dry-run-promote-no-mutation
+          upload: 'true'
+
+      - name: Assert dry-run promote mutated nothing
+        env:
+          RUN_ID: ${{ steps.promote.outputs.run_id }}
+          STATE_BLOB: ${{ steps.baseline.outputs.state_blob }}
+          TAGS: ${{ steps.baseline.outputs.tags }}
+          RELEASES: ${{ steps.baseline.outputs.releases }}
+          DEPLOYS: ${{ steps.baseline.outputs.deploys }}
+        run: |
+          set -euo pipefail
+          fail=0
+          JOBS_JSON="$(gh run view "$RUN_ID" --json jobs,conclusion)"
+          conclusion_of() {
+            echo "$JOBS_JSON" | jq -r --arg n "$1" \
+              '[.jobs[] | select(.name | startswith($n))] | (.[0].conclusion // "missing")'
+          }
+          assert() {
+            local label="$1" got="$2" want="$3"
+            if [ "$got" != "$want" ]; then echo "::error::$label was '$got', expected '$want'"; fail=1; else echo "OK: $label is '$got'"; fi
+          }
+          # Run is green, and the mutating jobs were skipped by the dry_run gate.
+          assert "dry-run promote conclusion" "$(echo "$JOBS_JSON" | jq -r '.conclusion')" success
+          assert "Promote job skipped" "$(conclusion_of 'Promote')" skipped
+          assert "Deploy app job skipped" "$(conclusion_of 'Deploy app')" skipped
+          # Committed state, tags, releases, and Deployments are all unchanged.
+          git fetch origin "$TRUNK" --quiet
+          NOW_BLOB="$(git rev-parse "origin/$TRUNK:$MANIFEST")"
+          assert "manifest state blob unchanged" "$NOW_BLOB" "$STATE_BLOB"
+          NOW_TAGS="$(git ls-remote --tags origin | wc -l | tr -d ' ')"
+          assert "tag count unchanged" "$NOW_TAGS" "$TAGS"
+          NOW_RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq 'length' || echo 0)"
+          assert "release count unchanged" "$NOW_RELEASES" "$RELEASES"
+          NOW_DEPLOYS="$(gh api "repos/$GITHUB_REPOSITORY/deployments?per_page=100" --jq 'length' || echo 0)"
+          assert "Deployment count unchanged (no dry-run Deployment)" "$NOW_DEPLOYS" "$DEPLOYS"
+          [ "$fail" -eq 0 ] || { echo "::error::dry-run promote mutated observable state"; exit 1; }
+
+      # --- Phase D: dry-run rollback rehearses prod rollback, mutating nothing ---
+
+      - name: Dispatch dry-run rollback
+        id: rollback
+        run: |
+          set -euo pipefail
+          BEFORE="$(date -u +%s)"
+          gh workflow run cascade-rollback.yaml --ref "$TRUNK" \
+            -f environment=prod -f dry_run=true
+          RUN_ID=""
+          for i in $(seq 1 12); do
+            RUN_ID="$(gh run list --workflow=cascade-rollback.yaml --event=workflow_dispatch \
+              --json databaseId,createdAt \
+              --jq "[.[] | select((.createdAt | fromdateiso8601) >= $BEFORE)] | (.[0].databaseId // empty)" | head -n1 || true)"
+            [ -n "$RUN_ID" ] && break
+            echo "attempt $i: dry-run rollback run not visible yet"
+            sleep 15
+          done
+          [ -n "$RUN_ID" ] || { echo "::error::no dry-run rollback run found"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          gh run watch "$RUN_ID" --exit-status --interval 30
+
+      - name: Register dry-run rollback run
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.rollback.outputs.run_id }}
+          expected-conclusion: success
+          reason: dry-run-rollback-no-mutation
+          upload: 'true'
+
+      - name: Assert dry-run rollback mutated nothing
+        env:
+          RUN_ID: ${{ steps.rollback.outputs.run_id }}
+          STATE_BLOB: ${{ steps.baseline.outputs.state_blob }}
+          TAGS: ${{ steps.baseline.outputs.tags }}
+          DEPLOYS: ${{ steps.baseline.outputs.deploys }}
+        run: |
+          set -euo pipefail
+          fail=0
+          JOBS_JSON="$(gh run view "$RUN_ID" --json jobs,conclusion)"
+          conclusion_of() {
+            echo "$JOBS_JSON" | jq -r --arg n "$1" \
+              '[.jobs[] | select(.name | startswith($n))] | (.[0].conclusion // "missing")'
+          }
+          assert() {
+            local label="$1" got="$2" want="$3"
+            if [ "$got" != "$want" ]; then echo "::error::$label was '$got', expected '$want'"; fail=1; else echo "OK: $label is '$got'"; fi
+          }
+          # Run is green (preflight resolved the target), and the mutating jobs
+          # (deploy, finalize) were skipped by the dry_run gate.
+          assert "dry-run rollback conclusion" "$(echo "$JOBS_JSON" | jq -r '.conclusion')" success
+          assert "Deploy app job skipped" "$(conclusion_of 'Deploy app')" skipped
+          assert "Finalize job skipped" "$(conclusion_of 'Finalize')" skipped
+          # Committed state and Deployments are unchanged; the rehearsal wrote nothing.
+          git fetch origin "$TRUNK" --quiet
+          NOW_BLOB="$(git rev-parse "origin/$TRUNK:$MANIFEST")"
+          assert "manifest state blob unchanged" "$NOW_BLOB" "$STATE_BLOB"
+          NOW_TAGS="$(git ls-remote --tags origin | wc -l | tr -d ' ')"
+          assert "tag count unchanged" "$NOW_TAGS" "$TAGS"
+          NOW_DEPLOYS="$(gh api "repos/$GITHUB_REPOSITORY/deployments?per_page=100" --jq 'length' || echo 0)"
+          assert "Deployment count unchanged (no dry-run Deployment)" "$NOW_DEPLOYS" "$DEPLOYS"
+
+          {
+            echo "## Dry-run promote and rollback rehearsed without mutation"
+            echo "- native staging Deployment created and succeeded on the real orchestrate run"
+            echo "- dry-run promote: mutating jobs skipped, state/tags/releases/deployments unchanged"
+            echo "- dry-run rollback: mutating jobs skipped, state/tags/deployments unchanged"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$fail" -eq 0 ] || { echo "::error::dry-run rollback mutated observable state"; exit 1; }
+
+  # Reconcile gate: enumerates every run this repo produced since window-start and
+  # fails closed if any is unregistered or concluded other than its registered
+  # expectation.
+  reconcile:
+    name: Reconcile scenario-window runs
+    needs: [open-window, lifecycle]
+    if: always()
+    uses: stablekernel/cascade/.github/workflows/fleet-reconcile.yaml@main
+    permissions:
+      contents: read
+      actions: read
+    with:
+      window-start: ${{ needs.open-window.outputs.window-start }}
+      cascade-ref: main

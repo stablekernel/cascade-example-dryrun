@@ -1,0 +1,42 @@
+name: build
+
+# Build callee. Minimal stub emitting an artifact id; this repo proves dry-run
+# and native-deployment semantics, not build content. Inputs are the superset the
+# generated orchestrate, promote, and hotfix workflows pass, all optional.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment for the build
+        required: false
+        type: string
+      sha:
+        description: Commit SHA being built
+        required: false
+        type: string
+      target_env:
+        description: Environment a hotfix build targets
+        required: false
+        type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      artifact_id:
+        description: Immutable artifact identifier
+        value: ${{ jobs.build.outputs.artifact_id }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.build.outputs.artifact_id }}
+    steps:
+      - id: build
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          echo "building at ${SHA}"
+          echo "artifact_id=app-${SHA}" >> "$GITHUB_OUTPUT"

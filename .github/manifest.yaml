@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://stablekernel.github.io/cascade/manifest.schema.json
+ci:
+  config:
+    schema_version: 1
+    trunk_branch: main
+    cli_version: v0.16.5
+    cli_version_sha: 2231b2bee90615ffb66cdee3a3cfd410720df370
+    state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
+    manifest_file: .github/manifest.yaml
+    manifest_key: ci
+    # Two environments so a staging to prod promotion (and its dry-run rehearsal)
+    # has a real source and target. Each carries an environment_url so the native
+    # GitHub Deployments lifecycle reports a real deployment URL for whichever
+    # environment a run deploys.
+    environments:
+      - name: staging
+        environment_url: "https://staging.example.com"
+      - name: prod
+        environment_url: "https://app.example.com"
+    triggers: [src/**]
+    # Opt in to the native GitHub Deployments API. The finalize job of orchestrate
+    # and promote creates a real Deployment for the runtime-selected environment,
+    # marks it in_progress, then reports a terminal status with the environment_url.
+    # Every Deployments-API step is guarded to real GitHub and to a non-dry-run
+    # run, so a dry-run rehearsal creates no Deployment.
+    deployments:
+      enabled: true
+      keep_prior_active: true
+    builds:
+      - name: build
+        workflow: .github/workflows/build.yaml
+        triggers: []
+    deploys:
+      - name: app
+        workflow: .github/workflows/deploy-app.yaml
+        triggers: []
+  state:
+    # prod starts with no current deployment and a single deploy-history ring
+    # entry. The ring entry gives the dry-run rollback a resolvable prior target
+    # (resolved from previous-ring, no git needed), so the rollback rehearsal can
+    # run and be asserted non-mutating without first establishing two real prod
+    # deployments each suite run. A real orchestrate run establishes staging (and
+    # the positive native-Deployment proof) at suite time.
+    prod:
+      previous:
+        - sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          version: v0.9.0
+          committed_at: "2026-07-10T00:00:00Z"
+          committed_by: seed
+    staging: {}

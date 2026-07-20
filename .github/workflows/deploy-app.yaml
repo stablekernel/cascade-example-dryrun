@@ -1,0 +1,34 @@
+name: deploy-app
+
+# Deploy callee. A minimal, always-succeeding deploy: this repo proves the
+# dry-run promote and rollback rehearsals leave state, tags, and native
+# deployments untouched, and that a real (non-dry-run) run creates a native
+# GitHub Deployment. The deploy body itself needs no failure injection.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+      sha:
+        required: false
+        type: string
+      version:
+        required: false
+        type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          echo "deploy-app ran for environment=${ENVIRONMENT} sha=${SHA}"
